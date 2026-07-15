@@ -1,38 +1,50 @@
 package com.brainsherpa.neurogait
 
-import android.annotation.SuppressLint
-import android.bluetooth.*
 import android.content.res.ColorStateList
 import android.graphics.Color
-import android.os.Build
 import android.os.Bundle
-import android.os.Environment
+import android.os.Handler
+import android.os.Looper
 import android.util.Log
+import android.view.WindowManager
 import android.widget.Button
 import android.widget.TextView
 import android.widget.Toast
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
-import android.view.WindowManager
-import java.io.File
-import java.io.FileWriter
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.GlobalScope
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
+import com.movesense.mds.Mds
+import com.movesense.mds.MdsConnectionListener
+import com.movesense.mds.MdsException
+import com.movesense.mds.MdsNotificationListener
+import com.movesense.mds.MdsSubscription
+import org.json.JSONObject
 import java.text.SimpleDateFormat
 import java.util.*
 import kotlin.math.pow
 import kotlin.math.sqrt
 
+/**
+ * Streams IMU6 (accelerometer + gyroscope) from a Movesense sensor using the
+ * official MDS (Movesense) library instead of raw BLE GATT.
+ *
+ * Flow:  MDS connect -> onConnectionComplete gives the serial -> tap START ->
+ *        mds.subscribe("suunto://MDS/EventListener", {"Uri":"<serial>/Meas/IMU6/104"})
+ *        -> onNotification delivers JSON with ArrayAcc / ArrayGyro.
+ */
 class StreamActivity : AppCompatActivity() {
 
+    private val mds: Mds get() = (application as App).mds
     private var deviceAddress: String? = null
-    private var bluetoothGatt: BluetoothGatt? = null
-    private var isServicesDiscovered = false
-    
-    // Movesense Suunto GATT UUIDs
-    private val MOVESENSE_SERVICE_UUID = UUID.fromString("61353090-8231-49cc-b57a-886370740041")
-    private val NOTIFY_CHARACTERISTIC_UUID = UUID.fromString("34802252-7185-4d5d-b431-630e7050e8f0")
-    private val WRITE_CHARACTERISTIC_UUID = UUID.fromString("17816557-5652-417f-909f-3aee61e5fa85")
-    private val CLIENT_CHARACTERISTIC_CONFIG = UUID.fromString("00002902-0000-1000-8000-00805f9b34fb")
+    private var serial: String? = null
+    private var subscription: MdsSubscription? = null
+    private var isConnected = false
 
     private val dataList = mutableListOf<SensorData>()
     private var isStreaming = false
@@ -40,9 +52,10 @@ class StreamActivity : AppCompatActivity() {
     private var lastAccMag = 0f
     private var startTime = 0L
     private var peakImpact = 0f
-    
     private val cadenceWindow = mutableListOf<Long>()
+
     private val TAG = "StreamActivity"
+    private val GRAVITY = 9.80665f   // Movesense accelerometer reports m/s^2; divide to get g
 
     private lateinit var tvAcc: TextView
     private lateinit var tvGyr: TextView
@@ -50,7 +63,30 @@ class StreamActivity : AppCompatActivity() {
     private lateinit var tvTime: TextView
     private lateinit var tvCadence: TextView
     private lateinit var tvPeak: TextView
+    private lateinit var tvStatus: TextView
     private lateinit var btnToggle: Button
+    private var lastDataMs = 0L
+
+    // Wall-clock timer so ELAPSED TIME ticks even before/without data.
+    private val uiHandler = Handler(Looper.getMainLooper())
+    private val timerTick = object : Runnable {
+        override fun run() {
+            if (isStreaming) {
+                val elapsed = (System.currentTimeMillis() - startTime) / 1000
+                tvTime.text = "${elapsed}s"
+                // Watchdog: if no sensor packet for >4s, the stream stalled - say so instead of lying.
+                val stalled = System.currentTimeMillis() - lastDataMs > 4000
+                if (stalled) {
+                    tvStatus.text = "⚠ Signal lost — hold still / move closer"
+                    tvStatus.setTextColor(Color.parseColor("#FF9800"))
+                } else {
+                    tvStatus.text = "● Streaming (live)"
+                    tvStatus.setTextColor(Color.parseColor("#4CAF50"))
+                }
+                uiHandler.postDelayed(this, 1000)
+            }
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -63,231 +99,248 @@ class StreamActivity : AppCompatActivity() {
         tvTime = findViewById(R.id.tv_time)
         tvCadence = findViewById(R.id.tv_cadence)
         tvPeak = findViewById(R.id.tv_peak)
+        tvStatus = findViewById(R.id.tv_status)
         btnToggle = findViewById(R.id.btn_toggle)
 
         btnToggle.setOnClickListener {
+            if (isStreaming) stopStreaming() else startStreaming()
+        }
+        findViewById<Button>(R.id.btn_exit).setOnClickListener {
             if (isStreaming) {
-                stopStreaming()
+                stopStreaming()   // stops, then the Save-and-exit dialog takes over
             } else {
-                startStreaming()
+                finishAffinity()  // actually close the app, not just return to the scan screen
             }
         }
-        
-        connectGatt()
+        // Keep header/buttons clear of the status bar and nav bar.
+        ViewCompat.setOnApplyWindowInsetsListener(findViewById(R.id.stream_root)) { v, insets ->
+            val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+            v.setPadding(bars.left, bars.top, bars.right, bars.bottom)
+            insets
+        }
+
+        connectSensor()
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
     }
 
-    @SuppressLint("MissingPermission")
-    private fun connectGatt() {
-        val bluetoothManager = getSystemService(BLUETOOTH_SERVICE) as BluetoothManager
-        val device = bluetoothManager.adapter.getRemoteDevice(deviceAddress)
-        Log.d(TAG, "Connecting to ${device.address}")
-        bluetoothGatt = device.connectGatt(this, false, gattCallback)
+    private fun connectSensor() {
+        val addr = deviceAddress
+        if (addr == null) {
+            Toast.makeText(this, "No device address", Toast.LENGTH_LONG).show()
+            return
+        }
+        Log.i(TAG, "MDS connecting to $addr")
+        mds.connect(addr, object : MdsConnectionListener {
+            override fun onConnect(s: String?) {
+                Log.i(TAG, "onConnect: $s")
+            }
+
+            override fun onConnectionComplete(macAddress: String?, serialNumber: String?) {
+                serial = serialNumber
+                isConnected = true
+                Log.i(TAG, "onConnectionComplete mac=$macAddress serial=$serialNumber")
+                runOnUiThread {
+                    Toast.makeText(
+                        this@StreamActivity,
+                        "Device ready ($serialNumber). Tap START.",
+                        Toast.LENGTH_SHORT
+                    ).show()
+                }
+            }
+
+            override fun onError(e: MdsException?) {
+                Log.e(TAG, "MDS connection error", e)
+                runOnUiThread {
+                    Toast.makeText(this@StreamActivity, "Connect error: ${e?.message}", Toast.LENGTH_LONG).show()
+                }
+            }
+
+            override fun onDisconnect(s: String?) {
+                isConnected = false
+                Log.i(TAG, "onDisconnect: $s")
+            }
+        })
     }
 
-    private val gattCallback = object : BluetoothGattCallback() {
-        @SuppressLint("MissingPermission")
-        override fun onConnectionStateChange(gatt: BluetoothGatt, status: Int, newState: Int) {
-            if (newState == BluetoothProfile.STATE_CONNECTED) {
-                Log.i(TAG, "Connected to GATT server. Discovering services...")
-                gatt.discoverServices()
-            } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
-                Log.i(TAG, "Disconnected from GATT server.")
-                isStreaming = false
-                isServicesDiscovered = false
-                runOnUiThread {
-                    Toast.makeText(this@StreamActivity, "Disconnected", Toast.LENGTH_SHORT).show()
-                }
-            }
-        }
-
-        override fun onServicesDiscovered(gatt: BluetoothGatt, status: Int) {
-            if (status == BluetoothGatt.GATT_SUCCESS) {
-                Log.i(TAG, "Services discovered. Count: ${gatt.services.size}")
-                
-                gatt.services.forEach { service ->
-                    Log.d(TAG, "Service: ${service.uuid}")
-                    service.characteristics.forEach { characteristic ->
-                        Log.d(TAG, "  Characteristic: ${characteristic.uuid}")
-                    }
-                }
-
-                isServicesDiscovered = true
-                runOnUiThread {
-                    Toast.makeText(this@StreamActivity, "Found ${gatt.services.size} services. Device Ready", Toast.LENGTH_SHORT).show()
-                }
-            } else {
-                Log.e(TAG, "Service discovery failed with status: $status")
-            }
-        }
-
-        @Deprecated("Deprecated in API 33")
-        override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic) {
-            if (characteristic.uuid == NOTIFY_CHARACTERISTIC_UUID) {
-                val value = characteristic.value
-                Log.d("IMU", "Raw bytes received (deprecated): ${value?.size ?: 0} bytes")
-                processRawData(value)
-            }
-        }
-
-        override fun onCharacteristicChanged(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, value: ByteArray) {
-            if (characteristic.uuid == NOTIFY_CHARACTERISTIC_UUID) {
-                Log.d("IMU", "Raw bytes received: ${value.size} bytes")
-                processRawData(value)
-            }
-        }
-        
-        override fun onCharacteristicWrite(gatt: BluetoothGatt, characteristic: BluetoothGattCharacteristic, status: Int) {
-             Log.d(TAG, "onCharacteristicWrite: UUID=${characteristic.uuid}, status=$status")
-        }
-
-        override fun onDescriptorWrite(gatt: BluetoothGatt, descriptor: BluetoothGattDescriptor, status: Int) {
-             Log.d(TAG, "onDescriptorWrite: UUID=${descriptor.uuid}, status=$status")
-             if (status == BluetoothGatt.GATT_SUCCESS && descriptor.characteristic.uuid == NOTIFY_CHARACTERISTIC_UUID) {
-                 sendSubscribeCommand()
-             }
-        }
-    }
-
-    @SuppressLint("MissingPermission")
     private fun startStreaming() {
-        if (isStreaming || bluetoothGatt == null) return
-        if (!isServicesDiscovered) {
-            Toast.makeText(this, "Still discovering services...", Toast.LENGTH_SHORT).show()
+        if (isStreaming) return
+        val ser = serial
+        if (!isConnected || ser == null) {
+            Toast.makeText(this, "Still connecting to sensor…", Toast.LENGTH_SHORT).show()
             return
         }
 
-        val service = bluetoothGatt?.getService(MOVESENSE_SERVICE_UUID)
-        if (service == null) {
-            Log.e(TAG, "Movesense service not found: $MOVESENSE_SERVICE_UUID")
-            Toast.makeText(this, "Movesense service not found", Toast.LENGTH_SHORT).show()
-            return
-        }
+        isStreaming = true
+        dataList.clear()
+        stepCount = 0
+        peakImpact = 0f
+        lastAccMag = 0f
+        cadenceWindow.clear()
+        startTime = System.currentTimeMillis()
+        lastDataMs = System.currentTimeMillis()
+        updateToggleButton()
+        uiHandler.post(timerTick)
 
-        val writeChar = service.getCharacteristic(WRITE_CHARACTERISTIC_UUID)
-        val notifyChar = service.getCharacteristic(NOTIFY_CHARACTERISTIC_UUID)
+        val uri = "suunto://MDS/EventListener"
+        val contract = "{\"Uri\":\"$ser/Meas/IMU6/104\"}"
+        Log.i(TAG, "Subscribing: $contract")
+        subscription = mds.subscribe(uri, contract, object : MdsNotificationListener {
+            override fun onNotification(data: String?) {
+                if (data != null) parseAndProcess(data)
+            }
 
-        if (writeChar != null && notifyChar != null) {
-            isStreaming = true
-            dataList.clear()
-            stepCount = 0
-            peakImpact = 0f
-            startTime = System.currentTimeMillis()
-            cadenceWindow.clear()
-            updateToggleButton()
-
-            // 1. Enable notifications for Notify Characteristic
-            bluetoothGatt?.setCharacteristicNotification(notifyChar, true)
-            val descriptor = notifyChar.getDescriptor(CLIENT_CHARACTERISTIC_CONFIG)
-            if (descriptor != null) {
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                    bluetoothGatt?.writeDescriptor(descriptor, BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE)
-                } else {
-                    @Suppress("DEPRECATION")
-                    descriptor.value = BluetoothGattDescriptor.ENABLE_NOTIFICATION_VALUE
-                    bluetoothGatt?.writeDescriptor(descriptor)
+            override fun onError(e: MdsException?) {
+                Log.e(TAG, "Subscription error", e)
+                runOnUiThread {
+                    Toast.makeText(this@StreamActivity, "Stream error: ${e?.message}", Toast.LENGTH_LONG).show()
+                    isStreaming = false
+                    updateToggleButton()
                 }
             }
-            // 2. Subscribe command will be sent in onDescriptorWrite
-            
-            runOnUiThread { Toast.makeText(this, "Streaming started", Toast.LENGTH_SHORT).show() }
-        } else {
-            val errorMsg = "Characteristics not found. Write: ${writeChar != null}, Notify: ${notifyChar != null}"
-            Log.e(TAG, errorMsg)
-            Toast.makeText(this, errorMsg, Toast.LENGTH_LONG).show()
+        })
+        Toast.makeText(this, "Streaming started", Toast.LENGTH_SHORT).show()
+    }
+
+    private fun parseAndProcess(json: String) {
+        try {
+            val root = JSONObject(json)
+            val body = root.optJSONObject("Body") ?: root
+            val accArr = body.optJSONArray("ArrayAcc")
+            val gyrArr = body.optJSONArray("ArrayGyro")
+
+            if (accArr == null || accArr.length() == 0) {
+                Log.d("IMU", "Notification w/o ArrayAcc: ${json.take(140)}")
+                return
+            }
+
+            val n = accArr.length()
+            var lastAxG = 0f; var lastAyG = 0f; var lastAzG = 0f
+            var lastGx = 0f; var lastGy = 0f; var lastGz = 0f
+            val now = System.currentTimeMillis()
+
+            for (i in 0 until n) {
+                val a = accArr.getJSONObject(i)
+                val axG = a.getDouble("x").toFloat() / GRAVITY
+                val ayG = a.getDouble("y").toFloat() / GRAVITY
+                val azG = a.getDouble("z").toFloat() / GRAVITY
+                var gx = 0f; var gy = 0f; var gz = 0f
+                if (gyrArr != null && i < gyrArr.length()) {
+                    val g = gyrArr.getJSONObject(i)
+                    gx = g.getDouble("x").toFloat()
+                    gy = g.getDouble("y").toFloat()
+                    gz = g.getDouble("z").toFloat()
+                }
+                lastAxG = axG; lastAyG = ayG; lastAzG = azG
+                lastGx = gx; lastGy = gy; lastGz = gz
+
+                val mag = sqrt(axG.pow(2) + ayG.pow(2) + azG.pow(2))
+                if (lastAccMag > 1.2f && mag < 1.2f) {
+                    stepCount++
+                    cadenceWindow.add(now)
+                    cadenceWindow.removeAll { it < now - 10000 }
+                }
+                lastAccMag = mag
+                if (mag > peakImpact) peakImpact = mag
+
+                val cadenceSample = if (cadenceWindow.size > 1) (cadenceWindow.size.toFloat() / 10f) * 60f else 0f
+                dataList.add(SensorData(now, axG, ayG, azG, gx, gy, gz, stepCount, cadenceSample, peakImpact))
+            }
+
+            Log.d("IMU", "Batch %d samples | Acc(%.2f,%.2f,%.2f)g Gyr(%.1f,%.1f,%.1f)"
+                .format(n, lastAxG, lastAyG, lastAzG, lastGx, lastGy, lastGz))
+
+            lastDataMs = System.currentTimeMillis()   // watchdog: mark that fresh data arrived
+            val cadence = if (cadenceWindow.size > 1) (cadenceWindow.size.toFloat() / 10f) * 60f else 0f
+            runOnUiThread {
+                tvAcc.text = String.format("%.2f, %.2f, %.2f", lastAxG, lastAyG, lastAzG)
+                tvGyr.text = String.format("%.2f, %.2f, %.2f", lastGx, lastGy, lastGz)
+                tvSteps.text = stepCount.toString()
+                tvCadence.text = cadence.toInt().toString()
+                tvPeak.text = String.format("%.2f", peakImpact)
+            }
+        } catch (e: Exception) {
+            Log.e("IMU", "Parse error: ${e.message} | ${json.take(160)}")
         }
     }
 
-    private fun processRawData(bytes: ByteArray?) {
-        if (bytes == null || bytes.size < 26) return
-
-        val buffer = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
-        buffer.get() // Skip 1st byte
-        buffer.get() // Skip 2nd byte
-        
-        val axG = buffer.float
-        val ayG = buffer.float
-        val azG = buffer.float
-        val gx = buffer.float
-        val gy = buffer.float
-        val gz = buffer.float
-
-        // Log the parsed values to verify sensor data flow
-        Log.d("IMU", "Parsed: Acc(%.2f, %.2f, %.2f) Gyr(%.2f, %.2f, %.2f)".format(axG, ayG, azG, gx, gy, gz))
-
-        val currentTime = System.currentTimeMillis()
-        val mag = sqrt(axG.pow(2) + ayG.pow(2) + azG.pow(2))
-        
-        if (lastAccMag > 1.2f && mag < 1.2f) {
-            stepCount++
-            cadenceWindow.add(currentTime)
-            cadenceWindow.removeAll { it < currentTime - 10000 }
-        }
-        lastAccMag = mag
-        if (mag > peakImpact) peakImpact = mag
-
-        val cadence = if (cadenceWindow.size > 1) {
-            (cadenceWindow.size.toFloat() / 10f) * 60f
-        } else 0f
-
-        dataList.add(SensorData(currentTime, axG, ayG, azG, gx, gy, gz, stepCount, cadence, peakImpact))
-
-        runOnUiThread {
-            // Update ALL text views to ensure real-time feedback
-            tvAcc.text = String.format("%.2f, %.2f, %.2f", axG, ayG, azG)
-            tvGyr.text = String.format("%.2f, %.2f, %.2f", gx, gy, gz)
-            val elapsed = (System.currentTimeMillis() - startTime) / 1000
-            tvSteps.text = stepCount.toString()
-            tvTime.text = "${elapsed}s"
-            tvCadence.text = cadence.toInt().toString()
-            tvPeak.text = String.format("%.2fg", peakImpact)
-        }
-    }
-
-    @SuppressLint("MissingPermission")
+    /** STOP: halt the stream, then ask whether to save + exit. */
     private fun stopStreaming() {
         if (!isStreaming) return
         isStreaming = false
         updateToggleButton()
-        
-        val service = bluetoothGatt?.getService(MOVESENSE_SERVICE_UUID)
-        val writeChar = service?.getCharacteristic(WRITE_CHARACTERISTIC_UUID)
-        if (writeChar != null) {
-             // Unsubscribe: 0x02, RequestID 0x01
-             val unsubscribeCommand = byteArrayOf(0x02, 0x01)
-             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                 bluetoothGatt?.writeCharacteristic(writeChar, unsubscribeCommand, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
-             } else {
-                 @Suppress("DEPRECATION")
-                 writeChar.value = unsubscribeCommand
-                 bluetoothGatt?.writeCharacteristic(writeChar)
-             }
-        }
-        
-        saveToCsv()
+        uiHandler.removeCallbacks(timerTick)
+        subscription?.unsubscribe()
+        subscription = null
+        promptSaveAndExit()
     }
 
-    @SuppressLint("MissingPermission")
-    private fun sendSubscribeCommand() {
-        if (!isStreaming) return
-        val service = bluetoothGatt?.getService(MOVESENSE_SERVICE_UUID)
-        val writeChar = service?.getCharacteristic(WRITE_CHARACTERISTIC_UUID)
-        if (writeChar != null) {
-            val path = "/Meas/IMU6/104"
-            val pathBytes = path.toByteArray(Charsets.UTF_8)
-            val subscribeCommand = ByteArray(2 + pathBytes.size)
-            subscribeCommand[0] = 0x01  // REQUEST_TYPE_SUBSCRIBE
-            subscribeCommand[1] = 99    // request ID
-            pathBytes.copyInto(subscribeCommand, 2)
-            
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                bluetoothGatt?.writeCharacteristic(writeChar, subscribeCommand, BluetoothGattCharacteristic.WRITE_TYPE_DEFAULT)
-            } else {
-                @Suppress("DEPRECATION")
-                writeChar.value = subscribeCommand
-                bluetoothGatt?.writeCharacteristic(writeChar)
+    private fun promptSaveAndExit() {
+        if (dataList.isEmpty()) {
+            Toast.makeText(this, "No data captured — nothing to save", Toast.LENGTH_LONG).show()
+            finish()   // back to the scan screen
+            return
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Save and exit?")
+            .setMessage("Upload this session to your NeuroMetric account and close the app?")
+            .setCancelable(false)
+            .setPositiveButton("YES") { _, _ -> saveAndExit() }
+            .setNegativeButton("NO") { d, _ ->
+                d.dismiss()
+                Toast.makeText(this, "Session discarded", Toast.LENGTH_SHORT).show()
+                finish()   // discard, back to the scan screen
+            }
+            .show()
+    }
+
+    /** Upload the session summary + full raw stream, then close the app. */
+    @OptIn(kotlinx.coroutines.DelicateCoroutinesApi::class)
+    private fun saveAndExit() {
+        Toast.makeText(this, "Saving session…", Toast.LENGTH_SHORT).show()
+        val metrics = buildMetrics()
+        val recordedAt = metrics.recordedAt
+        val samplesCsv = buildSamplesCsv()
+        val sampleCount = dataList.size
+        GlobalScope.launch(Dispatchers.IO) {
+            withTimeoutOrNull(15000) {
+                SuiteSyncRepository.pushSessionMetrics(metrics)
+                SuiteSyncRepository.pushRawSession(recordedAt, sampleCount, samplesCsv)
+            }
+            withContext(Dispatchers.Main) {
+                Toast.makeText(this@StreamActivity, "Session saved ✅", Toast.LENGTH_SHORT).show()
+                finishAffinity()   // fully close the app
             }
         }
+    }
+
+    private fun buildMetrics(): PaceSessionMetrics {
+        val durationS = ((System.currentTimeMillis() - startTime) / 1000).toInt()
+        val cadenceAvg = if (durationS > 0) stepCount * 60.0 / durationS else 0.0
+        val cadencePeak = if (dataList.isEmpty()) 0.0 else dataList.maxOf { it.cadence }.toDouble()
+        val meanImpact = if (dataList.isEmpty()) 0.0
+            else dataList.map { sqrt(it.ax.pow(2) + it.ay.pow(2) + it.az.pow(2)) }.average()
+        val recordedAt = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss'Z'", Locale.US).apply {
+            timeZone = TimeZone.getTimeZone("UTC")
+        }.format(Date())
+        return PaceSessionMetrics(
+            recordedAt = recordedAt,
+            sessionDurationS = durationS,
+            stepsTotal = stepCount,
+            cadenceSpmAvg = cadenceAvg,
+            cadenceSpmPeak = cadencePeak,
+            peakImpactG = peakImpact.toDouble(),
+            meanImpactG = meanImpact
+        )
+    }
+
+    /** Same columns the phone CSV used — now carried straight to Supabase instead of a file. */
+    private fun buildSamplesCsv(): String {
+        val sb = StringBuilder()
+        sb.append("timestamp_ms,accX_g,accY_g,accZ_g,gyrX,gyrY,gyrZ,step_count,cadence_spm,peak_impact_g\n")
+        dataList.forEach { d ->
+            sb.append("${d.ts},${d.ax},${d.ay},${d.az},${d.gx},${d.gy},${d.gz},${d.steps},${d.cadence},${d.peak}\n")
+        }
+        return sb.toString()
     }
 
     private fun updateToggleButton() {
@@ -304,32 +357,19 @@ class StreamActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
-        closeGatt()
+        uiHandler.removeCallbacks(timerTick)
+        subscription?.unsubscribe()
+        try {
+            deviceAddress?.let { mds.disconnect(it) }
+        } catch (_: Exception) {
+        }
         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
     }
 
-    @SuppressLint("MissingPermission")
-    private fun closeGatt() {
-        bluetoothGatt?.close()
-        bluetoothGatt = null
-    }
-
-    private fun saveToCsv() {
-        val fileName = "Session_${SimpleDateFormat("yyyyMMdd_HHmmss", Locale.getDefault()).format(Date())}.csv"
-        val file = File(getExternalFilesDir(Environment.DIRECTORY_DOCUMENTS), fileName)
-        
-        try {
-            FileWriter(file).use { writer ->
-                writer.append("timestamp_ms,accX,accY,accZ,gyrX,gyrY,gyrZ,step_count,cadence_spm,peak_impact_g\n")
-                dataList.forEach { d ->
-                    writer.append("${d.ts},${d.ax},${d.ay},${d.az},${d.gx},${d.gy},${d.gz},${d.steps},${d.cadence},${d.peak}\n")
-                }
-            }
-            Toast.makeText(this, "Saved to ${file.absolutePath}", Toast.LENGTH_LONG).show()
-        } catch (e: Exception) {
-            Log.e(TAG, "Error saving CSV", e)
-        }
-    }
-
-    data class SensorData(val ts: Long, val ax: Float, val ay: Float, val az: Float, val gx: Float, val gy: Float, val gz: Float, val steps: Int, val cadence: Float, val peak: Float)
+    data class SensorData(
+        val ts: Long,
+        val ax: Float, val ay: Float, val az: Float,
+        val gx: Float, val gy: Float, val gz: Float,
+        val steps: Int, val cadence: Float, val peak: Float
+    )
 }

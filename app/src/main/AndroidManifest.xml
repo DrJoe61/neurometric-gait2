@@ -25,6 +25,9 @@
     <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE"
         android:maxSdkVersion="28"/>
 
+    <!-- Network for Supabase sync -->
+    <uses-permission android:name="android.permission.INTERNET"/>
+
     <!-- BLE hardware required -->
     <uses-feature android:name="android.hardware.bluetooth_le"
         android:required="true"/>
@@ -48,7 +51,15 @@
         </activity>
 
         <activity android:name=".StreamActivity"
-            android:exported="false"/>
+            android:exported="false"
+            android:screenOrientation="portrait"
+            android:configChanges="orientation|screenSize|smallestScreenSize|screenLayout|keyboardHidden" />
+
+        <!-- Google sign-in gate. Material3 theme required or the MaterialButton fails to inflate. -->
+        <activity
+            android:name=".GoogleSignInActivity"
+            android:exported="false"
+            android:theme="@style/Theme.Material3.DayNight.NoActionBar" />
 
         <activity android:name=".HistoryActivity"
             android:exported="false"/>
